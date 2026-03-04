@@ -306,6 +306,30 @@ const extractErrorMessage = (payload: unknown): string | undefined => {
   return undefined;
 };
 
+const isTaskEndpointMissingError = (error: unknown) => {
+  if (!axios.isAxiosError(error)) {
+    return false;
+  }
+
+  if (error.response?.status !== 404) {
+    return false;
+  }
+
+  const payload = error.response?.data;
+  if (typeof payload === "string") {
+    return payload.includes("Invalid URL") || payload.includes("/tasks/");
+  }
+
+  if (!isRecord(payload)) {
+    return false;
+  }
+
+  const message = extractErrorMessage(payload);
+  return Boolean(
+    message && message.includes("Invalid URL") && message.includes("/tasks/")
+  );
+};
+
 const waitWithCancel = (ms: number, cancelToken?: CancelToken) => {
   if (!cancelToken) {
     return new Promise<void>((resolve) => {
@@ -347,14 +371,26 @@ export const createAiArtClient = (config: AiArtClientConfig) => {
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       options?.cancelToken?.throwIfRequested?.();
 
-      const response = await client.get(`/tasks/${encodeURIComponent(task.taskId)}`, {
-        cancelToken: options?.cancelToken,
-        headers: {
-          "X-ModelScope-Task-Type": "image_generation",
-        },
-      });
-
-      const payload = response.data;
+      let payload: unknown;
+      try {
+        const response = await client.get(
+          `/tasks/${encodeURIComponent(task.taskId)}`,
+          {
+            cancelToken: options?.cancelToken,
+            headers: {
+              "X-ModelScope-Task-Type": "image_generation",
+            },
+          }
+        );
+        payload = response.data;
+      } catch (error) {
+        if (isTaskEndpointMissingError(error)) {
+          throw new Error(
+            "当前网关不支持 /v1/tasks 查询（常见于 NewAPI 代理）。请改为直连 ModelScope，或在网关侧增加任务查询转发后再试。"
+          );
+        }
+        throw error;
+      }
       const images = normalizeImagePayload(payload);
       if (images.length) {
         return images;
