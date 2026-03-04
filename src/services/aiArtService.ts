@@ -98,28 +98,292 @@ const parseModelList = (payload: unknown): ModelDescriptor[] => {
     }));
 };
 
+type AsyncTaskMeta = {
+  taskId: string;
+  taskStatus?: string;
+  requestId?: string;
+};
+
+const TASK_COMPLETED_STATUSES = new Set([
+  "SUCCEED",
+  "SUCCEEDED",
+  "SUCCESS",
+  "COMPLETED",
+  "FINISHED",
+  "DONE",
+]);
+
+const TASK_FAILED_STATUSES = new Set([
+  "FAILED",
+  "FAIL",
+  "ERROR",
+  "CANCELED",
+  "CANCELLED",
+  "REJECTED",
+  "TIMEOUT",
+]);
+
+const toStringId = (value: unknown) => {
+  if (typeof value === "string") {
+    return value.trim() || undefined;
+  }
+  if (typeof value === "number") {
+    return String(value);
+  }
+  return undefined;
+};
+
+const normalizeStatus = (value?: string) => value?.trim().toUpperCase();
+
+const isTaskCompleted = (status?: string) => {
+  if (!status) {
+    return false;
+  }
+  return TASK_COMPLETED_STATUSES.has(normalizeStatus(status) ?? "");
+};
+
+const isTaskFailed = (status?: string) => {
+  if (!status) {
+    return false;
+  }
+  return TASK_FAILED_STATUSES.has(normalizeStatus(status) ?? "");
+};
+
+const normalizeImageItem = (
+  item: unknown
+): GeneratedImageResponse | undefined => {
+  if (typeof item === "string") {
+    const value = item.trim();
+    if (!value) {
+      return undefined;
+    }
+    if (value.startsWith("http://") || value.startsWith("https://")) {
+      return { url: value };
+    }
+    return {
+      b64_json: value.replace(/^data:image\/\w+;base64,/, ""),
+    };
+  }
+
+  if (!isRecord(item)) {
+    return undefined;
+  }
+
+  const urlCandidates = [item.url, item.image_url, item.output_url, item.path];
+  const b64Candidates = [item.b64_json, item.base64, item.image_base64];
+
+  const url = urlCandidates.find(
+    (candidate): candidate is string => typeof candidate === "string"
+  );
+  const b64 = b64Candidates.find(
+    (candidate): candidate is string => typeof candidate === "string"
+  );
+
+  if (!url && !b64) {
+    return undefined;
+  }
+
+  return {
+    ...item,
+    ...(url ? { url } : {}),
+    ...(b64 ? { b64_json: b64.replace(/^data:image\/\w+;base64,/, "") } : {}),
+  };
+};
+
+const normalizeImageList = (list: unknown[]): GeneratedImageResponse[] => {
+  return list
+    .map((item) => normalizeImageItem(item))
+    .filter((item): item is GeneratedImageResponse => Boolean(item));
+};
+
 const normalizeImagePayload = (raw: unknown): GeneratedImageResponse[] => {
   if (Array.isArray(raw)) {
-    return raw;
+    return normalizeImageList(raw);
   }
-  if (raw && typeof raw === "object") {
-    const candidates = [
-      (raw as Record<string, unknown>).images,
-      (raw as Record<string, unknown>).data,
-    ];
-    for (const candidate of candidates) {
-      if (Array.isArray(candidate)) {
-        return candidate.filter(
-          (item) => item && typeof item === "object"
-        ) as GeneratedImageResponse[];
+
+  if (!isRecord(raw)) {
+    return [];
+  }
+
+  const dataRecord = isRecord(raw.data) ? raw.data : undefined;
+  const outputRecord = isRecord(raw.output) ? raw.output : undefined;
+  const resultRecord = isRecord(raw.result) ? raw.result : undefined;
+
+  const candidates: unknown[] = [
+    raw.images,
+    raw.data,
+    raw.results,
+    raw.output_images,
+    dataRecord?.images,
+    dataRecord?.results,
+    dataRecord?.output_images,
+    outputRecord?.images,
+    outputRecord?.results,
+    outputRecord?.output_images,
+    resultRecord?.images,
+    resultRecord?.results,
+    resultRecord?.output_images,
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      const normalized = normalizeImageList(candidate);
+      if (normalized.length) {
+        return normalized;
       }
     }
   }
+
   return [];
+};
+
+const extractTaskMeta = (payload: unknown): AsyncTaskMeta | undefined => {
+  if (!isRecord(payload)) {
+    return undefined;
+  }
+
+  const dataRecord = isRecord(payload.data) ? payload.data : undefined;
+  const outputRecord = isRecord(payload.output) ? payload.output : undefined;
+
+  const taskId =
+    toStringId(payload.task_id) ??
+    toStringId(dataRecord?.task_id) ??
+    toStringId(outputRecord?.task_id);
+
+  if (!taskId) {
+    return undefined;
+  }
+
+  const taskStatus =
+    typeof payload.task_status === "string"
+      ? payload.task_status
+      : typeof dataRecord?.task_status === "string"
+      ? dataRecord.task_status
+      : typeof outputRecord?.task_status === "string"
+      ? outputRecord.task_status
+      : undefined;
+
+  const requestId =
+    toStringId(payload.request_id) ??
+    toStringId(dataRecord?.request_id) ??
+    toStringId(outputRecord?.request_id);
+
+  return {
+    taskId,
+    taskStatus,
+    requestId,
+  };
+};
+
+const extractErrorMessage = (payload: unknown): string | undefined => {
+  if (!isRecord(payload)) {
+    return undefined;
+  }
+
+  const dataRecord = isRecord(payload.data) ? payload.data : undefined;
+  const outputRecord = isRecord(payload.output) ? payload.output : undefined;
+
+  const candidates: unknown[] = [
+    payload.message,
+    payload.error,
+    payload.error_msg,
+    payload.detail,
+    payload.task_error,
+    dataRecord?.message,
+    dataRecord?.error,
+    dataRecord?.detail,
+    outputRecord?.message,
+    outputRecord?.error,
+    outputRecord?.detail,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return undefined;
+};
+
+const waitWithCancel = (ms: number, cancelToken?: CancelToken) => {
+  if (!cancelToken) {
+    return new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      resolve();
+    }, ms);
+
+    cancelToken.promise
+      .then((reason) => {
+        clearTimeout(timer);
+        reject(reason);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+      });
+  });
 };
 
 export const createAiArtClient = (config: AiArtClientConfig) => {
   const client: AxiosInstance = buildClient(config);
+
+  async function pollImageTask(
+    task: AsyncTaskMeta,
+    options?: {
+      cancelToken?: CancelToken;
+      intervalMs?: number;
+      timeoutMs?: number;
+    }
+  ): Promise<GeneratedImageResponse[]> {
+    const intervalMs = options?.intervalMs ?? 1500;
+    const timeoutMs = options?.timeoutMs ?? 120000;
+    const maxAttempts = Math.max(1, Math.ceil(timeoutMs / intervalMs));
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      options?.cancelToken?.throwIfRequested?.();
+
+      const response = await client.get(`/tasks/${encodeURIComponent(task.taskId)}`, {
+        cancelToken: options?.cancelToken,
+        headers: {
+          "X-ModelScope-Task-Type": "image_generation",
+        },
+      });
+
+      const payload = response.data;
+      const images = normalizeImagePayload(payload);
+      if (images.length) {
+        return images;
+      }
+
+      const latestTask = extractTaskMeta(payload);
+      const currentStatus = latestTask?.taskStatus ?? task.taskStatus;
+
+      if (isTaskFailed(currentStatus)) {
+        const message =
+          extractErrorMessage(payload) ??
+          `任务执行失败（task_id=${task.taskId}, status=${currentStatus ?? "FAILED"}）`;
+        throw new Error(message);
+      }
+
+      if (isTaskCompleted(currentStatus)) {
+        const message =
+          extractErrorMessage(payload) ??
+          `任务已完成但未返回图片（task_id=${task.taskId}）`;
+        throw new Error(message);
+      }
+
+      if (attempt < maxAttempts - 1) {
+        await waitWithCancel(intervalMs, options?.cancelToken);
+      }
+    }
+
+    throw new Error(`任务轮询超时（task_id=${task.taskId}）`);
+  }
 
   async function fetchModels(): Promise<ModelDescriptor[]> {
     const response = await client.get("/models");
@@ -177,10 +441,29 @@ export const createAiArtClient = (config: AiArtClientConfig) => {
     if (options.guidance !== undefined) {
       payload.guidance = options.guidance;
     }
+
     const response = await client.post("/images/generations", payload, {
       cancelToken: options.cancelToken,
     });
-    return normalizeImagePayload(response.data);
+
+    const immediateImages = normalizeImagePayload(response.data);
+    if (immediateImages.length) {
+      return immediateImages;
+    }
+
+    const taskMeta = extractTaskMeta(response.data);
+    if (taskMeta?.taskId) {
+      return pollImageTask(taskMeta, {
+        cancelToken: options.cancelToken,
+      });
+    }
+
+    const message = extractErrorMessage(response.data);
+    if (message) {
+      throw new Error(message);
+    }
+
+    return [];
   }
 
   async function editImage(

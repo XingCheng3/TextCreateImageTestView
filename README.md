@@ -15,6 +15,7 @@
 - 拉取 `/models` 模型列表
 - 可选先走 LLM 优化提示词，再请求图像生成
 - 支持参考图、遮罩、负面提示词、seed/steps/guidance
+- 兼容异步任务型响应（如 ModelScope：先返回 `task_id`，再自动轮询拿图）
 - 历史结果可回填做下一轮微调
 
 ### 2) NovelAI 流式画图
