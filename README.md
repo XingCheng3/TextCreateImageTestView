@@ -100,6 +100,22 @@ npm run kill:all       # 关闭常见开发端口
 npm run restart        # 重启前后端开发环境
 ```
 
+## 宝塔部署（静态站点）
+
+项目提供一键脚本将最新 `dist/` 同步到宝塔站点目录：
+
+```bash
+./scripts/deploy-bt.sh
+# 或自定义目录
+./scripts/deploy-bt.sh /www/wwwroot/Web/TextCreateImage
+```
+
+脚本行为：
+
+- 本地执行 `npm run build`
+- 使用 `rsync` 覆盖站点静态资源（保留 `.htaccess` / `.user.ini`）
+- 适合将 Vite 前端直接发布到宝塔 Nginx 站点
+
 ## 安全建议
 
 - 不要把 API Key 提交到仓库
