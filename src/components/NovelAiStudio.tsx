@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Card,
   CardContent,
@@ -32,8 +32,10 @@ import {
   Cpu,
   Download,
   Image,
+  Loader2,
   Settings,
   Trash,
+  X,
   Zap,
 } from "lucide-react";
 
@@ -130,6 +132,11 @@ const MODEL_OPTIONS = ["nai-diffusion-4-5-curated", "nai-diffusion-4-5-full"];
 const clampNumber = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
 
+const normalizeDimension = (value: number) => {
+  const clamped = clampNumber(value, 512, 1536);
+  return Math.round(clamped / 64) * 64;
+};
+
 /** 尝试将任意值转为有效数字（可用于 step、sigma 等字段） */
 const parseNumeric = (value: unknown) => {
   if (value === undefined || value === null) {
@@ -138,6 +145,22 @@ const parseNumeric = (value: unknown) => {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : undefined;
 };
+
+const parseInputNumber = (value: string, fallback: number) => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const isAbortError = (error: unknown) =>
+  error instanceof DOMException
+    ? error.name === "AbortError"
+    : error instanceof Error
+    ? error.name === "AbortError"
+    : false;
 
 /** 将纯 base64 或者 data URL 转成前端可识别的 data:image 形式 */
 const toDataUrl = (value?: string | null) => {
@@ -220,6 +243,12 @@ export function NovelAiStudio() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [livePreview, setLivePreview] = useState<string | null>(null);
   const [finalImage, setFinalImage] = useState<string | null>(null);
+  const [abortController, setAbortController] =
+    useState<AbortController | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const startedAtRef = useRef<number | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const novelClient = useMemo(
     () =>
@@ -243,6 +272,42 @@ export function NovelAiStudio() {
   const updateConfig = (partial: Partial<NovelAiConfig>) => {
     setConfig((prev) => ({ ...prev, ...partial }));
   };
+
+  const updateNumberConfig = <K extends keyof NovelAiConfig>(
+    key: K,
+    value: string,
+    fallback: Extract<NovelAiConfig[K], number>
+  ) => {
+    const parsed = parseInputNumber(value, fallback) as NovelAiConfig[K];
+    updateConfig({ [key]: parsed } as Pick<NovelAiConfig, K>);
+  };
+
+  const stopTimer = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    startedAtRef.current = null;
+    setElapsedSeconds(0);
+  };
+
+  const startTimer = () => {
+    stopTimer();
+    startedAtRef.current = Date.now();
+    timerRef.current = setInterval(() => {
+      if (!startedAtRef.current) {
+        return;
+      }
+      setElapsedSeconds(Math.floor((Date.now() - startedAtRef.current) / 1000));
+    }, 1000);
+  };
+
+  useEffect(() => {
+    return () => {
+      stopTimer();
+      abortRef.current?.abort();
+    };
+  }, []);
 
   const handleReferenceUpload = async (
     event: React.ChangeEvent<HTMLInputElement>
@@ -326,62 +391,103 @@ export function NovelAiStudio() {
   };
 
   const handleGenerate = async () => {
-    if (!prompt.trim()) {
+    const normalizedPrompt = prompt.trim();
+    const normalizedNegativePrompt = negativePrompt.trim() || undefined;
+
+    if (!normalizedPrompt) {
       toast({ title: "请输入 Prompt", variant: "destructive" });
       return;
     }
-    if (!config.apiToken) {
+    if (!config.apiToken.trim()) {
       toast({ title: "请配置 NovelAI Token", variant: "destructive" });
       return;
     }
 
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setAbortController(controller);
     setGenerating(true);
     setAnalysisLog([]);
     setPayloadPreview("");
     setErrorMessage(null);
     setLivePreview(null);
     setFinalImage(null);
+    startTimer();
+
     const parsedCharacterPrompts = (config.characterPrompts ?? "")
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean);
 
     try {
+      const width = normalizeDimension(
+        parseNumeric(config.width) ?? DEFAULT_NOVEL_CONFIG.width
+      );
+      const height = normalizeDimension(
+        parseNumeric(config.height) ?? DEFAULT_NOVEL_CONFIG.height
+      );
+      if (width !== config.width || height !== config.height) {
+        pushLog("分辨率已自动修正为 64 的倍数");
+      }
+
       const options = {
-        prompt,
-        negativePrompt,
+        prompt: normalizedPrompt,
+        negativePrompt: normalizedNegativePrompt,
         model: config.model,
-        width: clampNumber(config.width, 512, 1536),
-        height: clampNumber(config.height, 512, 1536),
-        steps: clampNumber(config.steps, 10, 60),
-        scale: clampNumber(config.scale, 1, 20),
+        width,
+        height,
+        steps: clampNumber(
+          parseNumeric(config.steps) ?? DEFAULT_NOVEL_CONFIG.steps,
+          10,
+          60
+        ),
+        scale: clampNumber(
+          parseNumeric(config.scale) ?? DEFAULT_NOVEL_CONFIG.scale,
+          1,
+          20
+        ),
         sampler: config.sampler,
-        nSamples: clampNumber(config.nSamples, 1, 4),
+        nSamples: clampNumber(
+          parseNumeric(config.nSamples) ?? DEFAULT_NOVEL_CONFIG.nSamples,
+          1,
+          4
+        ),
         seed: ensureSeed(),
         stream: "msgpack" as const,
         noiseSchedule: config.noiseSchedule,
-        ucPreset: config.ucPreset,
+        ucPreset: parseNumeric(config.ucPreset) ?? DEFAULT_NOVEL_CONFIG.ucPreset,
         qualityToggle: config.qualityToggle,
-        cfgRescale: config.cfgRescale,
-        paramsVersion: config.paramsVersion,
+        cfgRescale:
+          parseNumeric(config.cfgRescale) ?? DEFAULT_NOVEL_CONFIG.cfgRescale,
+        paramsVersion:
+          parseNumeric(config.paramsVersion) ??
+          DEFAULT_NOVEL_CONFIG.paramsVersion,
         dynamicThresholding: config.dynamicThresholding,
         autoSmea: config.autoSmea,
-        controlnetStrength: config.controlnetStrength,
         useCoords: config.useCoords,
         useOrder: config.useOrder,
-        legacy: config.legacy,
-        legacyUc: config.legacyUc,
-        legacyV3Extend: config.legacyV3Extend,
-        skipCfgAboveSigma: config.skipCfgAboveSigma,
-        normalizeReferenceStrengthMultiple:
-          config.normalizeReferenceStrengthMultiple,
-        inpaintStrength: config.inpaintStrength,
-        deliberateEulerAncestralBug: config.deliberateEulerAncestralBug,
-        preferBrownian: config.preferBrownian,
-        useNewSharedTrial: config.useNewSharedTrial,
-        recaptchaToken: config.recaptchaToken,
         characterPrompts: parsedCharacterPrompts,
         referenceImage,
+        extraParameters: {
+          controlnet_strength:
+            parseNumeric(config.controlnetStrength) ??
+            DEFAULT_NOVEL_CONFIG.controlnetStrength,
+          legacy: config.legacy,
+          legacy_uc: config.legacyUc,
+          legacy_v3_extend: config.legacyV3Extend,
+          skip_cfg_above_sigma:
+            parseNumeric(config.skipCfgAboveSigma) ??
+            DEFAULT_NOVEL_CONFIG.skipCfgAboveSigma,
+          normalize_reference_strength_multiple:
+            config.normalizeReferenceStrengthMultiple,
+          inpaint_strength:
+            parseNumeric(config.inpaintStrength) ??
+            DEFAULT_NOVEL_CONFIG.inpaintStrength,
+          deliberate_euler_ancestral_bug: config.deliberateEulerAncestralBug,
+          prefer_brownian: config.preferBrownian,
+          use_new_shared_trial: config.useNewSharedTrial,
+          recaptcha_token: config.recaptchaToken.trim() || undefined,
+        },
       };
 
       const payload = buildNovelAiPayload(options);
@@ -404,6 +510,7 @@ export function NovelAiStudio() {
       };
       const result = await novelClient.request(payload, {
         onEvent: handleStreamEvent,
+        signal: controller.signal,
       });
       const finalResultImage = latestFinalImage ?? result.images[0] ?? null;
       if (finalResultImage) {
@@ -418,8 +525,8 @@ export function NovelAiStudio() {
 
       const entry: NovelAiHistoryEntry = {
         id: crypto.randomUUID?.() ?? `${Date.now()}`,
-        prompt,
-        negativePrompt,
+        prompt: normalizedPrompt,
+        negativePrompt: normalizedNegativePrompt,
         images: finalResultImage ? [finalResultImage] : [],
         createdAt: new Date().toISOString(),
         payloadPreview: JSON.stringify(payload, null, 2),
@@ -435,17 +542,31 @@ export function NovelAiStudio() {
         description: `共获得 ${result.images.length} 张图片`,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "生成失败";
+      const aborted = isAbortError(error);
+      const message = aborted
+        ? "请求已取消"
+        : error instanceof Error
+        ? error.message
+        : "生成失败";
       setErrorMessage(message);
       pushLog(message);
       toast({
-        title: "NovelAI 请求失败",
+        title: aborted ? "请求已取消" : "NovelAI 请求失败",
         description: message,
-        variant: "destructive",
+        variant: aborted ? undefined : "destructive",
       });
     } finally {
+      stopTimer();
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+      }
+      setAbortController(null);
       setGenerating(false);
     }
+  };
+
+  const handleCancelGenerate = () => {
+    abortController?.abort();
   };
 
   const previewImage = livePreview ?? finalImage;
@@ -481,7 +602,17 @@ export function NovelAiStudio() {
                   />
                 </div>
                 <div className="space-y-1">
-                  <Label>API Token</Label>
+                  <div className="flex items-center justify-between">
+                    <Label>API Token</Label>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      type="button"
+                      onClick={() => updateConfig({ apiToken: "" })}
+                    >
+                      清空
+                    </Button>
+                  </div>
                   <Input
                     type="password"
                     value={config.apiToken}
@@ -531,15 +662,35 @@ export function NovelAiStudio() {
             </section>
 
             <section className="space-y-3 border border-border rounded-lg p-4">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <h3 className="flex items-center gap-2 text-base font-medium">
                   <Image className="h-4 w-4 text-secondary" />
                   提示词
                 </h3>
-                <Button onClick={handleGenerate} disabled={generating}>
-                  {generating ? "生成中..." : "开始生成"}
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button onClick={handleGenerate} disabled={generating}>
+                    {generating ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : null}
+                    {generating ? "生成中..." : "开始生成"}
+                  </Button>
+                  {generating ? (
+                    <Button
+                      variant="outline"
+                      type="button"
+                      onClick={handleCancelGenerate}
+                    >
+                      <X className="mr-1 h-4 w-4" />
+                      取消
+                    </Button>
+                  ) : null}
+                </div>
               </div>
+              {generating ? (
+                <p className="text-xs text-muted-foreground">
+                  请求已等待 {elapsedSeconds} 秒
+                </p>
+              ) : null}
               <div className="space-y-2">
                 <Label>主要描述</Label>
                 <textarea
@@ -569,7 +720,11 @@ export function NovelAiStudio() {
                     max={4}
                     value={config.nSamples}
                     onChange={(e) =>
-                      updateConfig({ nSamples: Number(e.target.value) })
+                      updateNumberConfig(
+                        "nSamples",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.nSamples
+                      )
                     }
                   />
                 </div>
@@ -588,7 +743,11 @@ export function NovelAiStudio() {
                     step="0.5"
                     value={config.scale}
                     onChange={(e) =>
-                      updateConfig({ scale: Number(e.target.value) })
+                      updateNumberConfig(
+                        "scale",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.scale
+                      )
                     }
                   />
                 </div>
@@ -607,7 +766,11 @@ export function NovelAiStudio() {
                     type="number"
                     value={config.width}
                     onChange={(e) =>
-                      updateConfig({ width: Number(e.target.value) })
+                      updateNumberConfig(
+                        "width",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.width
+                      )
                     }
                   />
                 </div>
@@ -617,7 +780,11 @@ export function NovelAiStudio() {
                     type="number"
                     value={config.height}
                     onChange={(e) =>
-                      updateConfig({ height: Number(e.target.value) })
+                      updateNumberConfig(
+                        "height",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.height
+                      )
                     }
                   />
                 </div>
@@ -627,7 +794,11 @@ export function NovelAiStudio() {
                     type="number"
                     value={config.steps}
                     onChange={(e) =>
-                      updateConfig({ steps: Number(e.target.value) })
+                      updateNumberConfig(
+                        "steps",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.steps
+                      )
                     }
                   />
                 </div>
@@ -639,7 +810,11 @@ export function NovelAiStudio() {
                     type="number"
                     value={config.ucPreset}
                     onChange={(e) =>
-                      updateConfig({ ucPreset: Number(e.target.value) })
+                      updateNumberConfig(
+                        "ucPreset",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.ucPreset
+                      )
                     }
                   />
                 </div>
@@ -659,7 +834,11 @@ export function NovelAiStudio() {
                     step="0.1"
                     value={config.cfgRescale}
                     onChange={(e) =>
-                      updateConfig({ cfgRescale: Number(e.target.value) })
+                      updateNumberConfig(
+                        "cfgRescale",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.cfgRescale
+                      )
                     }
                   />
                 </div>
@@ -671,7 +850,11 @@ export function NovelAiStudio() {
                     type="number"
                     value={config.paramsVersion}
                     onChange={(e) =>
-                      updateConfig({ paramsVersion: Number(e.target.value) })
+                      updateNumberConfig(
+                        "paramsVersion",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.paramsVersion
+                      )
                     }
                   />
                 </div>
@@ -736,9 +919,11 @@ export function NovelAiStudio() {
                     step="0.1"
                     value={config.controlnetStrength}
                     onChange={(e) =>
-                      updateConfig({
-                        controlnetStrength: Number(e.target.value),
-                      })
+                      updateNumberConfig(
+                        "controlnetStrength",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.controlnetStrength
+                      )
                     }
                   />
                 </div>
@@ -832,9 +1017,11 @@ export function NovelAiStudio() {
                     type="number"
                     value={config.skipCfgAboveSigma}
                     onChange={(e) =>
-                      updateConfig({
-                        skipCfgAboveSigma: Number(e.target.value),
-                      })
+                      updateNumberConfig(
+                        "skipCfgAboveSigma",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.skipCfgAboveSigma
+                      )
                     }
                   />
                 </div>
@@ -865,9 +1052,11 @@ export function NovelAiStudio() {
                     step="0.1"
                     value={config.inpaintStrength}
                     onChange={(e) =>
-                      updateConfig({
-                        inpaintStrength: Number(e.target.value),
-                      })
+                      updateNumberConfig(
+                        "inpaintStrength",
+                        e.target.value,
+                        DEFAULT_NOVEL_CONFIG.inpaintStrength
+                      )
                     }
                   />
                 </div>
@@ -979,6 +1168,8 @@ export function NovelAiStudio() {
                   <img
                     src={referenceImage}
                     alt="参考图"
+                    loading="lazy"
+                    decoding="async"
                     className="max-h-48 w-full rounded-md object-contain"
                   />
                 </div>
@@ -996,8 +1187,8 @@ export function NovelAiStudio() {
                 </Alert>
               )}
               <div className="space-y-2 text-xs text-muted-foreground">
-                {analysisLog.map((log) => (
-                  <p key={log}>{log}</p>
+                {analysisLog.map((log, index) => (
+                  <p key={`${index}-${log}`}>{log}</p>
                 ))}
               </div>
             </section>
@@ -1038,6 +1229,8 @@ export function NovelAiStudio() {
                   <img
                     src={previewImage}
                     alt="NovelAI 画面"
+                    loading="lazy"
+                    decoding="async"
                     className="h-full w-full object-cover"
                   />
                 ) : (
@@ -1111,6 +1304,8 @@ export function NovelAiStudio() {
                           <img
                             src={entry.images[0]}
                             alt="历史图"
+                            loading="lazy"
+                            decoding="async"
                             className="h-full w-full object-cover"
                           />
                         ) : (

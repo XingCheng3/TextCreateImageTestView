@@ -89,6 +89,7 @@ export interface NovelAiGenerateResult {
 
 export interface NovelAiRequestOptions {
   onEvent?: (event: NovelAiStreamEvent) => void;
+  signal?: AbortSignal;
 }
 
 /** 将 payload 中的 JSON 字符串解析为对象，否则直接返回原始值 */
@@ -250,6 +251,7 @@ export const createNovelAiClient = (config: NovelAiClientConfig) => {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(payload),
+      signal: options?.signal,
     });
 
     if (!response.ok) {

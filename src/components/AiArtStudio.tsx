@@ -116,6 +116,40 @@ const parseNumberInput = (value?: string) => {
   return Number.isNaN(parsed) ? undefined : parsed;
 };
 
+const isValidHttpUrl = (value?: string) => {
+  if (!value) {
+    return false;
+  }
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
+const extractErrorMessage = (error: unknown, fallback: string) => {
+  if (axios.isCancel(error)) {
+    return "请求已取消";
+  }
+  if (axios.isAxiosError(error)) {
+    const data = error.response?.data as
+      | { message?: string; error?: string }
+      | undefined;
+    const payloadMessage = data?.message ?? data?.error;
+    if (payloadMessage) {
+      return payloadMessage;
+    }
+    if (error.message) {
+      return error.message;
+    }
+  }
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return fallback;
+};
+
 export function AiArtStudio() {
   const { toast } = useToast();
 
@@ -372,6 +406,8 @@ export function AiArtStudio() {
     const seedValue = parseNumberInput(config.seed);
     const stepsValue = parseNumberInput(config.steps);
     const guidanceValue = parseNumberInput(config.guidance);
+    const normalizedNegativePrompt = negativePrompt.trim() || undefined;
+    const normalizedEditNotes = editNotes.trim() || undefined;
     const trimmedRemoteReference = remoteReferenceUrl.trim();
     if (referenceFile || trimmedRemoteReference) {
       const form = new FormData();
@@ -387,11 +423,11 @@ export function AiArtStudio() {
       form.append("model", config.imageModel);
       form.append("n", "1");
       form.append("size", config.size);
-      if (negativePrompt) {
-        form.append("negative_prompt", negativePrompt);
+      if (normalizedNegativePrompt) {
+        form.append("negative_prompt", normalizedNegativePrompt);
       }
-      if (editNotes) {
-        form.append("edit_prompt", editNotes);
+      if (normalizedEditNotes) {
+        form.append("edit_prompt", normalizedEditNotes);
       }
       if (seedValue !== undefined) {
         form.append("seed", seedValue.toString());
@@ -412,7 +448,7 @@ export function AiArtStudio() {
       model: config.imageModel,
       size: config.size,
       n: 1,
-      negativePrompt: negativePrompt,
+      negativePrompt: normalizedNegativePrompt,
       seed: seedValue,
       steps: stepsValue,
       guidance: guidanceValue,
@@ -422,9 +458,21 @@ export function AiArtStudio() {
   };
 
   const handleGenerate = async () => {
-    if (!prompt.trim()) {
+    const normalizedPrompt = prompt.trim();
+    const normalizedExtraHint = extraHint.trim();
+    const normalizedRemoteReferenceUrl = remoteReferenceUrl.trim();
+
+    if (!normalizedPrompt) {
       toast({
         title: "请输入描述文本",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (normalizedRemoteReferenceUrl && !isValidHttpUrl(normalizedRemoteReferenceUrl)) {
+      toast({
+        title: "参考图 URL 无效",
+        description: "请填写以 http:// 或 https:// 开头的可访问地址",
         variant: "destructive",
       });
       return;
@@ -446,17 +494,20 @@ export function AiArtStudio() {
     setCancelSource(source);
     beginRequestTimer();
 
-    let promptForModel = prompt;
+    let promptForModel = normalizedPrompt;
 
     try {
       if (config.useLLM && config.llmModel) {
         pushLog("使用 LLM 优化提示词");
         const referenceData = await ensureReferenceDataUrl();
         const userContent: ChatMessageContentBlock[] = [
-          { type: "text", text: `原始描述：${prompt}` },
+          { type: "text", text: `原始描述：${normalizedPrompt}` },
         ];
-        if (extraHint) {
-          userContent.push({ type: "text", text: `补充要求：${extraHint}` });
+        if (normalizedExtraHint) {
+          userContent.push({
+            type: "text",
+            text: `补充要求：${normalizedExtraHint}`,
+          });
         }
         if (negativePrompt) {
           userContent.push({
@@ -488,18 +539,35 @@ export function AiArtStudio() {
         } else {
           pushLog("LLM 未返回优化结果，保留原始描述");
         }
+      } else if (normalizedExtraHint) {
+        promptForModel = `${normalizedPrompt}\n${normalizedExtraHint}`;
+        pushLog("已将附加细节合并到提示词");
       }
       setFinalPrompt(promptForModel);
       pushLog("开始调用画图 API");
       const collected: string[] = [];
+      const failedAttempts: string[] = [];
       for (let i = 0; i < config.outputCount; i += 1) {
         pushLog(`画图进度：第 ${i + 1}/${config.outputCount} 次`);
-        const urls = await callImageApiOnce(promptForModel, source.token);
-        if (urls.length) {
-          pushLog(`第 ${i + 1} 次返回 ${urls.length} 张图片`);
-          collected.push(...urls);
-        } else {
-          pushLog(`第 ${i + 1} 次未返回图片`);
+        try {
+          const urls = await callImageApiOnce(promptForModel, source.token);
+          if (urls.length) {
+            pushLog(`第 ${i + 1} 次返回 ${urls.length} 张图片`);
+            collected.push(...urls);
+            setGeneratedImages([...collected]);
+          } else {
+            pushLog(`第 ${i + 1} 次未返回图片`);
+          }
+        } catch (error) {
+          if (axios.isCancel(error)) {
+            throw error;
+          }
+          const message = extractErrorMessage(
+            error,
+            `第 ${i + 1} 次生成失败`
+          );
+          failedAttempts.push(message);
+          pushLog(`第 ${i + 1} 次失败：${message}`);
         }
       }
 
@@ -512,11 +580,11 @@ export function AiArtStudio() {
 
       const entry: AiArtHistoryEntry = {
         id: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
-        prompt: prompt,
+        prompt: normalizedPrompt,
         finalPrompt: promptForModel,
         images: collected.slice(0, 4),
         createdAt: new Date().toISOString(),
-        usedReference: Boolean(referenceFile),
+        usedReference: Boolean(referenceFile || normalizedRemoteReferenceUrl),
         configSnapshot: {
           imageModel: config.imageModel,
           size: config.size,
@@ -530,16 +598,21 @@ export function AiArtStudio() {
       });
 
       toast({
-        title: referenceFile ? "微调完成" : "生成完成",
+        title:
+          referenceFile || normalizedRemoteReferenceUrl ? "微调完成" : "生成完成",
         description: `生成 ${collected.length} 张图片`,
       });
+
+      if (failedAttempts.length) {
+        toast({
+          title: "部分请求失败",
+          description: `有 ${failedAttempts.length} 次请求未成功，已保留成功结果`,
+          variant: "destructive",
+        });
+      }
     } catch (error) {
       const isCanceled = axios.isCancel(error);
-      const message = isCanceled
-        ? "请求已取消"
-        : error instanceof Error
-        ? error.message
-        : "生成过程出现异常";
+      const message = extractErrorMessage(error, "生成过程出现异常");
       setErrorMessage(message);
       pushLog(`失败：${message}`);
       toast({
@@ -607,7 +680,17 @@ export function AiArtStudio() {
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="api-key">API Key</Label>
+              <div className="flex items-center justify-between">
+                <Label htmlFor="api-key">API Key</Label>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  type="button"
+                  onClick={() => updateConfig({ apiKey: "" })}
+                >
+                  清空
+                </Button>
+              </div>
               <Input
                 id="api-key"
                 type="password"
@@ -874,6 +957,8 @@ export function AiArtStudio() {
                 <img
                   src={referencePreview}
                   alt="参考图"
+                  loading="lazy"
+                  decoding="async"
                   className="max-h-48 w-full rounded-md object-contain"
                 />
               </div>
@@ -946,14 +1031,16 @@ export function AiArtStudio() {
               <p className="text-base font-medium">最新生成</p>
             </div>
             <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-              {generatedImages.map((url) => (
+              {generatedImages.map((url, index) => (
                 <div
-                  key={url}
+                  key={`${url}-${index}`}
                   className="relative rounded-lg border bg-muted/20 p-2 transition hover:border-primary"
                 >
                   <img
                     src={url}
                     alt="生成结果"
+                    loading="lazy"
+                    decoding="async"
                     className="h-40 w-full rounded-md object-cover"
                   />
                   <div className="mt-2 flex items-center justify-between gap-2 text-xs">
@@ -1012,6 +1099,8 @@ export function AiArtStudio() {
                         <img
                           src={image}
                           alt="历史图"
+                          loading="lazy"
+                          decoding="async"
                           className="h-24 w-full rounded-sm object-cover"
                         />
                       </button>
