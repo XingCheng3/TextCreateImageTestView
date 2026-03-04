@@ -79,6 +79,7 @@ const DEFAULT_CONFIG: AiArtConfig = {
 const DEFAULT_HISTORY: AiArtHistoryEntry[] = [];
 
 const MODEL_SELECT_PLACEHOLDER = "请选择模型";
+const EMPTY_LLM_RESULT_VALUE = "__no_llm_model_result__";
 
 const MAX_HISTORY_ITEMS = 6;
 
@@ -127,6 +128,8 @@ const isValidHttpUrl = (value?: string) => {
     return false;
   }
 };
+
+const isDataUrl = (value: string) => value.startsWith("data:");
 
 const extractErrorMessage = (error: unknown, fallback: string) => {
   if (axios.isCancel(error)) {
@@ -190,6 +193,7 @@ export function AiArtStudio() {
   );
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef(0);
+  const referenceSectionRef = useRef<HTMLElement | null>(null);
 
   const apiClient = useMemo(
     () =>
@@ -365,14 +369,34 @@ export function AiArtStudio() {
   };
 
   const handleUseHistoryImage = (image: string) => {
-    const file = dataUrlToFile(image);
-    setReferenceFile(file);
-    setReferenceDataUrl(image);
-    setRemoteReferenceUrl("");
-    toast({
-      title: "已采用历史图片",
-      description: "将在下一次生成中作为参考图像",
-    });
+    try {
+      if (isDataUrl(image)) {
+        const file = dataUrlToFile(image);
+        setReferenceFile(file);
+        setReferenceDataUrl(image);
+        setRemoteReferenceUrl("");
+      } else {
+        setReferenceFile(null);
+        setReferenceDataUrl(null);
+        setRemoteReferenceUrl(image);
+      }
+
+      referenceSectionRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+
+      toast({
+        title: "已采用历史图片",
+        description: "已切换到参考图区域，可直接继续微调",
+      });
+    } catch (error) {
+      toast({
+        title: "设置参考图失败",
+        description: error instanceof Error ? error.message : "请重试",
+        variant: "destructive",
+      });
+    }
   };
 
   const handleClearReference = () => {
@@ -634,483 +658,510 @@ export function AiArtStudio() {
   };
 
   return (
-    <Card className="space-y-6">
-      <CardHeader className="space-y-2">
+    <Card className="lg:border lg:shadow-sm">
+      <CardHeader className="space-y-2 pb-4">
         <div className="flex items-center gap-3">
           <Sparkles className="h-5 w-5 text-primary" />
           <CardTitle>OpenAI 兼容 AI 画图工作室</CardTitle>
         </div>
         <CardDescription className="text-sm text-muted-foreground">
-          纯前端完成：描述→（可选 LLM 优化）→画图
-          API→展示/微调，全部缓存于浏览器。
+          左侧调参与提示词，右侧看实时反馈、最新生成与历史微调。
         </CardDescription>
       </CardHeader>
 
-      <CardContent className="space-y-6">
-        <section className="space-y-4 border border-border rounded-lg p-4">
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Wand2 className="h-4 w-4 text-primary" />
-                <p className="text-base font-medium">API 配置</p>
+      <CardContent className="pt-0">
+        <div className="grid gap-5 lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+          <div className="space-y-4">
+            <section className="space-y-4 rounded-lg border border-border p-4">
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Wand2 className="h-4 w-4 text-primary" />
+                    <p className="text-base font-medium">API 配置</p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleFetchModels}
+                    disabled={!config.apiBaseUrl || loadingModels}
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                    刷新模型
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  API 需遵循 OpenAI/v1 格式，如{" "}
+                  {config.apiBaseUrl || "https://api.openai.com/v1"}。
+                </p>
               </div>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={handleFetchModels}
-                disabled={!config.apiBaseUrl || loadingModels}
-              >
-                <RefreshCw className="h-4 w-4" />
-                刷新模型
-              </Button>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              API 需遵循 OpenAI/v1 格式，如{" "}
-              {config.apiBaseUrl || "https://api.openai.com/v1"}。
-            </p>
-          </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-1">
-              <Label htmlFor="api-base">API 地址</Label>
-              <Input
-                id="api-base"
-                placeholder="https://xxxx/v1"
-                value={config.apiBaseUrl}
-                onChange={(e) => updateConfig({ apiBaseUrl: e.target.value })}
-              />
-            </div>
-            <div className="space-y-1">
-              <div className="flex items-center justify-between">
-                <Label htmlFor="api-key">API Key</Label>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  type="button"
-                  onClick={() => updateConfig({ apiKey: "" })}
-                >
-                  清空
-                </Button>
-              </div>
-              <Input
-                id="api-key"
-                type="password"
-                placeholder="Bearer ..."
-                value={config.apiKey}
-                onChange={(e) => updateConfig({ apiKey: e.target.value })}
-              />
-            </div>
-          </div>
-
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Label>LLM 模型（优化提示词）</Label>
-                <span className="text-xs text-muted-foreground">
-                  {filteredLLMModels.length}/{availableLLMModels.length}
-                </span>
-              </div>
-              <Input
-                placeholder="搜索模型"
-                className="text-sm"
-                value={llmModelFilter}
-                onChange={(e) => setLlmModelFilter(e.target.value)}
-              />
-              <Select
-                value={config.llmModel}
-                onValueChange={(value) => updateConfig({ llmModel: value })}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder={MODEL_SELECT_PLACEHOLDER} />
-                </SelectTrigger>
-                <SelectContent>
-                  {filteredLLMModels.length > 0 ? (
-                    mapModelList(filteredLLMModels)
-                  ) : (
-                    <SelectItem value="" disabled>
-                      未找到匹配模型
-                    </SelectItem>
-                  )}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1">
-              <Label>画图模型</Label>
-              <Input
-                placeholder="手动输入模型 ID"
-                list="image-model-suggestions"
-                value={config.imageModel}
-                onChange={(e) => updateConfig({ imageModel: e.target.value })}
-              />
-              <datalist id="image-model-suggestions">
-                {availableImageModels.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.description ?? model.name ?? model.id}
-                  </option>
-                ))}
-              </datalist>
-              <p className="text-xs text-muted-foreground">
-                模型列表仅为建议，实际画图模型由你输入的 ID 决定。
-              </p>
-            </div>
-            <div className="space-y-1">
-              <Label>分辨率</Label>
-              <Select
-                value={config.size}
-                onValueChange={(value) => updateConfig({ size: value })}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="选择分辨率" />
-                </SelectTrigger>
-                <SelectContent>
-                  {SIZE_OPTIONS.map((size) => (
-                    <SelectItem key={size} value={size}>
-                      {size}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1">
-              <Label>输出张数</Label>
-              <Select
-                value={config.outputCount.toString()}
-                onValueChange={(value) =>
-                  updateConfig({ outputCount: Number(value) })
-                }
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="1" />
-                </SelectTrigger>
-                <SelectContent>
-                  {OUTPUT_OPTIONS.map((count) => (
-                    <SelectItem key={count} value={count.toString()}>
-                      {count} 张
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="space-y-1">
-              <Label htmlFor="seed">随机种子（seed）</Label>
-              <Input
-                id="seed"
-                type="number"
-                min="0"
-                step="1"
-                placeholder="可选"
-                value={config.seed ?? ""}
-                onChange={(e) => updateConfig({ seed: e.target.value })}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="steps">采样步数（steps）</Label>
-              <Input
-                id="steps"
-                type="number"
-                min="1"
-                step="1"
-                placeholder="例如 30"
-                value={config.steps ?? ""}
-                onChange={(e) => updateConfig({ steps: e.target.value })}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="guidance">引导系数（guidance）</Label>
-              <Input
-                id="guidance"
-                type="number"
-                min="0"
-                step="0.1"
-                placeholder="例如 3.5"
-                value={config.guidance ?? ""}
-                onChange={(e) => updateConfig({ guidance: e.target.value })}
-              />
-            </div>
-          </div>
-
-          <p className="text-xs text-muted-foreground">
-            模型列表：
-            {models.length
-              ? `${models.length} 个模型，最后同步 ${formatTimestamp(
-                  modelsUpdatedAt
-                )}`
-              : "未同步"}
-          </p>
-          {modelsError && (
-            <Alert variant="destructive">
-              <AlertDescription>{modelsError}</AlertDescription>
-            </Alert>
-          )}
-        </section>
-
-        <section className="space-y-3 border border-border rounded-lg p-4">
-          <div className="flex items-center gap-2">
-            <Image className="h-4 w-4 text-secondary" />
-            <p className="text-base font-medium">输入提示与思考</p>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="prompt">主要描述</Label>
-            <textarea
-              id="prompt"
-              rows={3}
-              className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
-              placeholder="描述你想要的画面、风格、构图等"
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-            />
-          </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="extra-hint">附加细节（可选）</Label>
-              <textarea
-                id="extra-hint"
-                rows={2}
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
-                placeholder="例如光线、场景、情绪、参考艺术家、色调"
-                value={extraHint}
-                onChange={(e) => setExtraHint(e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="negative-prompt">排除内容（可选）</Label>
-              <textarea
-                id="negative-prompt"
-                rows={2}
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
-                placeholder="例如不要阴影噪点、人物不要有水印"
-                value={negativePrompt}
-                onChange={(e) => setNegativePrompt(e.target.value)}
-              />
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input
-              id="llm-switch"
-              type="checkbox"
-              checked={config.useLLM}
-              onChange={(e) => updateConfig({ useLLM: e.target.checked })}
-              className="h-4 w-4 rounded border border-border bg-background"
-            />
-            <label htmlFor="llm-switch">是否启用 LLM 优化提示词（可选）</label>
-          </div>
-
-          {finalPrompt && (
-            <Badge className="text-xs">【最终提示词】{finalPrompt}</Badge>
-          )}
-        </section>
-
-        <section className="space-y-3 border border-border rounded-lg p-4">
-          <div className="flex items-center gap-2">
-            <Layers className="h-4 w-4 text-secondary" />
-            <p className="text-base font-medium">参考图片 / 微调</p>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            上传一张用于微调的图片，或从下方历史中选择生成结果继续微调。也可以添加遮罩限定修改区域。
-          </p>
-          <div className="flex flex-wrap gap-3">
-            <label className="cursor-pointer rounded-md border border-dashed border-border px-3 py-2 text-sm text-muted-foreground transition hover:border-primary">
-              上传参考图
-              <input
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={handleReferenceUpload}
-              />
-            </label>
-            <label className="cursor-pointer rounded-md border border-dashed border-border px-3 py-2 text-sm text-muted-foreground transition hover:border-primary">
-              上传遮罩
-              <input
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={handleMaskUpload}
-              />
-            </label>
-            <Button size="sm" variant="outline" onClick={handleClearReference}>
-              清除参考图
-            </Button>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="remote-reference-url">
-              远程待编辑图片 URL（可选）
-            </Label>
-            <Input
-              id="remote-reference-url"
-              placeholder="https://your-host/image.png"
-              value={remoteReferenceUrl}
-              onChange={(event) =>
-                handleRemoteReferenceChange(event.target.value)
-              }
-            />
-            <p className="text-xs text-muted-foreground">
-              仅在不上传本地图片时使用，请确保地址可公网访问。
-            </p>
-          </div>
-          <div className="grid gap-2 md:grid-cols-2">
-            {referencePreview && (
-              <div className="rounded-md border p-2">
-                <p className="text-xs text-muted-foreground">参考图预览</p>
-                <img
-                  src={referencePreview}
-                  alt="参考图"
-                  loading="lazy"
-                  decoding="async"
-                  className="max-h-48 w-full rounded-md object-contain"
-                />
-              </div>
-            )}
-            {maskFile && (
-              <div className="rounded-md border px-3 py-2 text-xs text-muted-foreground">
-                已选择遮罩：{maskFile.name}
-              </div>
-            )}
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="edit-notes">微调补充说明（可选）</Label>
-            <textarea
-              id="edit-notes"
-              rows={2}
-              className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
-              placeholder="例如：只调整人物表情、加强天空色彩"
-              value={editNotes}
-              onChange={(e) => setEditNotes(e.target.value)}
-            />
-          </div>
-        </section>
-
-        <section className="space-y-3 border border-border rounded-lg p-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Clock3 className="h-4 w-4 text-secondary" />
-              <p className="text-base font-medium">实时反馈</p>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button onClick={handleGenerate} disabled={generating}>
-                {generating && (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin text-primary" />
-                )}
-                {generating ? "生成中..." : "立即生成"}
-              </Button>
-              {generating && (
-                <Button size="sm" variant="ghost" onClick={handleCancelRequest}>
-                  取消请求
-                </Button>
-              )}
-            </div>
-          </div>
-          {generating && (
-            <p className="text-xs text-muted-foreground">
-              请求已等待 {elapsedSeconds} 秒
-            </p>
-          )}
-          {errorMessage && (
-            <Alert variant="destructive">
-              <AlertDescription>{errorMessage}</AlertDescription>
-            </Alert>
-          )}
-          <div className="space-y-2">
-            {analysisLog.map((log, index) => (
-              <p
-                key={`${index}-${log}`}
-                className="text-xs text-muted-foreground"
-              >
-                {log}
-              </p>
-            ))}
-          </div>
-        </section>
-
-        {generatedImages.length > 0 && (
-          <section className="space-y-3 border border-border rounded-lg p-4">
-            <div className="flex items-center gap-2">
-              <Image className="h-4 w-4 text-primary" />
-              <p className="text-base font-medium">最新生成</p>
-            </div>
-            <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-              {generatedImages.map((url, index) => (
-                <div
-                  key={`${url}-${index}`}
-                  className="relative rounded-lg border bg-muted/20 p-2 transition hover:border-primary"
-                >
-                  <img
-                    src={url}
-                    alt="生成结果"
-                    loading="lazy"
-                    decoding="async"
-                    className="h-40 w-full rounded-md object-cover"
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-1">
+                  <Label htmlFor="api-base">API 地址</Label>
+                  <Input
+                    id="api-base"
+                    placeholder="https://xxxx/v1"
+                    value={config.apiBaseUrl}
+                    onChange={(e) => updateConfig({ apiBaseUrl: e.target.value })}
                   />
-                  <div className="mt-2 flex items-center justify-between gap-2 text-xs">
+                </div>
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="api-key">API Key</Label>
                     <Button
                       size="sm"
-                      variant="outline"
-                      onClick={() => handleUseHistoryImage(url)}
+                      variant="ghost"
+                      type="button"
+                      onClick={() => updateConfig({ apiKey: "" })}
                     >
-                      继续微调
+                      清空
                     </Button>
-                    <a
-                      href={url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-muted-foreground underline"
-                    >
-                      预览
-                    </a>
                   </div>
+                  <Input
+                    id="api-key"
+                    type="password"
+                    placeholder="Bearer ..."
+                    value={config.apiKey}
+                    onChange={(e) => updateConfig({ apiKey: e.target.value })}
+                  />
                 </div>
-              ))}
-            </div>
-          </section>
-        )}
+              </div>
 
-        {history.length > 0 && (
-          <section className="space-y-3 border border-border rounded-lg p-4">
-            <div className="flex items-center gap-2">
-              <Layers className="h-4 w-4 text-secondary" />
-              <p className="text-base font-medium">
-                历史记录（最多保留 {MAX_HISTORY_ITEMS} 条）
-              </p>
-            </div>
-            <div className="grid gap-3 md:grid-cols-2">
-              {history.map((item) => (
-                <div key={item.id} className="rounded-lg border p-3">
-                  <div className="flex items-center justify-between text-xs text-muted-foreground">
-                    <span>
-                      {new Date(item.createdAt).toLocaleString("zh-CN")}
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                <div className="space-y-2 md:col-span-2 xl:col-span-1">
+                  <div className="flex items-center justify-between">
+                    <Label>LLM 模型（优化提示词）</Label>
+                    <span className="text-xs text-muted-foreground">
+                      {filteredLLMModels.length}/{availableLLMModels.length}
                     </span>
-                    <Badge variant="outline">
-                      {item.usedReference ? "微调" : "原始生成"}
-                    </Badge>
                   </div>
-                  <p className="mt-2 text-sm text-foreground break-words">
-                    {item.finalPrompt}
+                  <Input
+                    placeholder="搜索模型"
+                    className="text-sm"
+                    value={llmModelFilter}
+                    onChange={(e) => setLlmModelFilter(e.target.value)}
+                  />
+                  <Select
+                    value={config.llmModel}
+                    onValueChange={(value) => updateConfig({ llmModel: value })}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder={MODEL_SELECT_PLACEHOLDER} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {filteredLLMModels.length > 0 ? (
+                        mapModelList(filteredLLMModels)
+                      ) : (
+                        <SelectItem value={EMPTY_LLM_RESULT_VALUE} disabled>
+                          未找到匹配模型
+                        </SelectItem>
+                      )}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <Label>画图模型</Label>
+                  <Input
+                    placeholder="手动输入模型 ID"
+                    list="image-model-suggestions"
+                    value={config.imageModel}
+                    onChange={(e) => updateConfig({ imageModel: e.target.value })}
+                  />
+                  <datalist id="image-model-suggestions">
+                    {availableImageModels.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.description ?? model.name ?? model.id}
+                      </option>
+                    ))}
+                  </datalist>
+                </div>
+                <div className="space-y-1">
+                  <Label>分辨率</Label>
+                  <Select
+                    value={config.size}
+                    onValueChange={(value) => updateConfig({ size: value })}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="选择分辨率" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {SIZE_OPTIONS.map((size) => (
+                        <SelectItem key={size} value={size}>
+                          {size}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <Label>输出张数</Label>
+                  <Select
+                    value={config.outputCount.toString()}
+                    onValueChange={(value) =>
+                      updateConfig({ outputCount: Number(value) })
+                    }
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="1" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {OUTPUT_OPTIONS.map((count) => (
+                        <SelectItem key={count} value={count.toString()}>
+                          {count} 张
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-3">
+                <div className="space-y-1">
+                  <Label htmlFor="seed">随机种子（seed）</Label>
+                  <Input
+                    id="seed"
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="可选"
+                    value={config.seed ?? ""}
+                    onChange={(e) => updateConfig({ seed: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="steps">采样步数（steps）</Label>
+                  <Input
+                    id="steps"
+                    type="number"
+                    min="1"
+                    step="1"
+                    placeholder="例如 30"
+                    value={config.steps ?? ""}
+                    onChange={(e) => updateConfig({ steps: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="guidance">引导系数（guidance）</Label>
+                  <Input
+                    id="guidance"
+                    type="number"
+                    min="0"
+                    step="0.1"
+                    placeholder="例如 3.5"
+                    value={config.guidance ?? ""}
+                    onChange={(e) => updateConfig({ guidance: e.target.value })}
+                  />
+                </div>
+              </div>
+
+              <p className="text-xs text-muted-foreground">
+                模型列表：
+                {models.length
+                  ? `${models.length} 个模型，最后同步 ${formatTimestamp(
+                      modelsUpdatedAt
+                    )}`
+                  : "未同步"}
+              </p>
+              {modelsError && (
+                <Alert variant="destructive">
+                  <AlertDescription>{modelsError}</AlertDescription>
+                </Alert>
+              )}
+            </section>
+
+            <section className="space-y-3 rounded-lg border border-border p-4">
+              <div className="flex items-center gap-2">
+                <Image className="h-4 w-4 text-secondary" />
+                <p className="text-base font-medium">输入提示与思考</p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="prompt">主要描述</Label>
+                <textarea
+                  id="prompt"
+                  rows={3}
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                  placeholder="描述你想要的画面、风格、构图等"
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="extra-hint">附加细节（可选）</Label>
+                  <textarea
+                    id="extra-hint"
+                    rows={2}
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    placeholder="例如光线、场景、情绪、参考艺术家、色调"
+                    value={extraHint}
+                    onChange={(e) => setExtraHint(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="negative-prompt">排除内容（可选）</Label>
+                  <textarea
+                    id="negative-prompt"
+                    rows={2}
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    placeholder="例如不要阴影噪点、人物不要有水印"
+                    value={negativePrompt}
+                    onChange={(e) => setNegativePrompt(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <input
+                  id="llm-switch"
+                  type="checkbox"
+                  checked={config.useLLM}
+                  onChange={(e) => updateConfig({ useLLM: e.target.checked })}
+                  className="h-4 w-4 rounded border border-border bg-background"
+                />
+                <label htmlFor="llm-switch">是否启用 LLM 优化提示词（可选）</label>
+              </div>
+
+              {finalPrompt && (
+                <Badge className="inline-flex max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-xs">
+                  最终提示词：{finalPrompt}
+                </Badge>
+              )}
+            </section>
+
+            <section
+              ref={referenceSectionRef}
+              className="space-y-3 rounded-lg border border-border p-4"
+            >
+              <div className="flex items-center gap-2">
+                <Layers className="h-4 w-4 text-secondary" />
+                <p className="text-base font-medium">参考图片 / 微调</p>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                上传一张用于微调的图片，或在右侧历史区点“继续微调”自动带入。
+              </p>
+              <div className="flex flex-wrap gap-3">
+                <label className="cursor-pointer rounded-md border border-dashed border-border px-3 py-2 text-sm text-muted-foreground transition hover:border-primary">
+                  上传参考图
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={handleReferenceUpload}
+                  />
+                </label>
+                <label className="cursor-pointer rounded-md border border-dashed border-border px-3 py-2 text-sm text-muted-foreground transition hover:border-primary">
+                  上传遮罩
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={handleMaskUpload}
+                  />
+                </label>
+                <Button size="sm" variant="outline" onClick={handleClearReference}>
+                  清除参考图
+                </Button>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="remote-reference-url">远程待编辑图片 URL（可选）</Label>
+                <Input
+                  id="remote-reference-url"
+                  placeholder="https://your-host/image.png"
+                  value={remoteReferenceUrl}
+                  onChange={(event) =>
+                    handleRemoteReferenceChange(event.target.value)
+                  }
+                />
+                <p className="text-xs text-muted-foreground">
+                  仅在不上传本地图片时使用，请确保地址可公网访问。
+                </p>
+              </div>
+              <div className="grid gap-2 md:grid-cols-2">
+                {referencePreview && (
+                  <div className="rounded-md border p-2">
+                    <p className="text-xs text-muted-foreground">参考图预览</p>
+                    <div className="mt-2 aspect-square overflow-hidden rounded-md border bg-muted/20">
+                      <img
+                        src={referencePreview}
+                        alt="参考图"
+                        loading="lazy"
+                        decoding="async"
+                        className="h-full w-full object-contain"
+                      />
+                    </div>
+                  </div>
+                )}
+                {maskFile && (
+                  <div className="rounded-md border px-3 py-2 text-xs text-muted-foreground">
+                    已选择遮罩：{maskFile.name}
+                  </div>
+                )}
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="edit-notes">微调补充说明（可选）</Label>
+                <textarea
+                  id="edit-notes"
+                  rows={2}
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                  placeholder="例如：只调整人物表情、加强天空色彩"
+                  value={editNotes}
+                  onChange={(e) => setEditNotes(e.target.value)}
+                />
+              </div>
+            </section>
+          </div>
+
+          <div className="space-y-4">
+            <section className="space-y-3 rounded-lg border border-border p-4">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Clock3 className="h-4 w-4 text-secondary" />
+                  <p className="text-base font-medium">实时反馈</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button onClick={handleGenerate} disabled={generating}>
+                    {generating && (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin text-primary" />
+                    )}
+                    {generating ? "生成中..." : "立即生成"}
+                  </Button>
+                  {generating && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={handleCancelRequest}
+                    >
+                      取消请求
+                    </Button>
+                  )}
+                </div>
+              </div>
+              {generating && (
+                <p className="text-xs text-muted-foreground">
+                  请求已等待 {elapsedSeconds} 秒
+                </p>
+              )}
+              {errorMessage && (
+                <Alert variant="destructive">
+                  <AlertDescription>{errorMessage}</AlertDescription>
+                </Alert>
+              )}
+              <div className="space-y-2">
+                {analysisLog.length > 0 ? (
+                  analysisLog.map((log, index) => (
+                    <p
+                      key={`${index}-${log}`}
+                      className="text-xs text-muted-foreground"
+                    >
+                      {log}
+                    </p>
+                  ))
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    暂无日志，点击“立即生成”后会显示调用过程。
                   </p>
-                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                    {item.images.slice(0, 2).map((image) => (
-                      <button
-                        key={image}
-                        className="rounded border border-border p-1"
-                        type="button"
-                        onClick={() => handleUseHistoryImage(image)}
-                      >
+                )}
+              </div>
+            </section>
+
+            <section className="space-y-3 rounded-lg border border-border p-4">
+              <div className="flex items-center gap-2">
+                <Image className="h-4 w-4 text-primary" />
+                <p className="text-base font-medium">最新生成</p>
+              </div>
+              {generatedImages.length > 0 ? (
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                  {generatedImages.map((url, index) => (
+                    <div
+                      key={`${url}-${index}`}
+                      className="rounded-lg border bg-muted/20 p-2 transition hover:border-primary"
+                    >
+                      <div className="aspect-square overflow-hidden rounded-md border bg-muted/10">
                         <img
-                          src={image}
-                          alt="历史图"
+                          src={url}
+                          alt="生成结果"
                           loading="lazy"
                           decoding="async"
-                          className="h-24 w-full rounded-sm object-cover"
+                          className="h-full w-full object-contain"
                         />
-                      </button>
-                    ))}
-                  </div>
+                      </div>
+                      <div className="mt-2 flex items-center justify-between gap-2 text-xs">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => handleUseHistoryImage(url)}
+                        >
+                          继续微调
+                        </Button>
+                        <a
+                          href={url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-muted-foreground underline"
+                        >
+                          预览
+                        </a>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          </section>
-        )}
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  暂无生成结果，左侧设置好参数后即可开始。
+                </p>
+              )}
+            </section>
+
+            <section className="space-y-3 rounded-lg border border-border p-4">
+              <div className="flex items-center gap-2">
+                <Layers className="h-4 w-4 text-secondary" />
+                <p className="text-base font-medium">
+                  历史记录（最多保留 {MAX_HISTORY_ITEMS} 条）
+                </p>
+              </div>
+              {history.length > 0 ? (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {history.map((item) => (
+                    <div key={item.id} className="rounded-lg border p-3">
+                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                        <span>{new Date(item.createdAt).toLocaleString("zh-CN")}</span>
+                        <Badge variant="outline">
+                          {item.usedReference ? "微调" : "原始生成"}
+                        </Badge>
+                      </div>
+                      <p className="mt-2 line-clamp-3 text-sm text-foreground break-words">
+                        {item.finalPrompt}
+                      </p>
+                      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                        {item.images.slice(0, 2).map((image, imageIndex) => (
+                          <button
+                            key={`${item.id}-${imageIndex}`}
+                            className="rounded border border-border p-1"
+                            type="button"
+                            onClick={() => handleUseHistoryImage(image)}
+                          >
+                            <div className="aspect-square overflow-hidden rounded-sm bg-muted/20">
+                              <img
+                                src={image}
+                                alt="历史图"
+                                loading="lazy"
+                                decoding="async"
+                                className="h-full w-full object-contain"
+                              />
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  暂无历史记录，生成后会自动保存到浏览器。
+                </p>
+              )}
+            </section>
+          </div>
+        </div>
       </CardContent>
       <CardFooter className="text-xs text-muted-foreground">
         所有数据保存在浏览器缓存中，API 请求直接发送给用户配置的 OpenAI

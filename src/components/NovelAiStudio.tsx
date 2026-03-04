@@ -1231,7 +1231,7 @@ export function NovelAiStudio() {
                     alt="NovelAI 画面"
                     loading="lazy"
                     decoding="async"
-                    className="h-full w-full object-cover"
+                    className="h-full w-full object-contain"
                   />
                 ) : (
                   <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-sm text-muted-foreground">
@@ -1306,7 +1306,7 @@ export function NovelAiStudio() {
                             alt="历史图"
                             loading="lazy"
                             decoding="async"
-                            className="h-full w-full object-cover"
+                            className="h-full w-full object-contain"
                           />
                         ) : (
                           <div className="flex h-full items-center justify-center text-[10px] text-muted-foreground">
