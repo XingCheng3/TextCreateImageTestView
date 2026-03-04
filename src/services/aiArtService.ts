@@ -67,20 +67,34 @@ const buildClient = (config: AiArtClientConfig) => {
   });
 };
 
-const parseModelList = (payload: any): ModelDescriptor[] => {
-  const list = payload?.data ?? payload?.models ?? [];
-  if (!Array.isArray(list)) {
-    return [];
-  }
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const parseModelList = (payload: unknown): ModelDescriptor[] => {
+  const list =
+    isRecord(payload) && Array.isArray(payload.data)
+      ? payload.data
+      : isRecord(payload) && Array.isArray(payload.models)
+      ? payload.models
+      : [];
+
   return list
-    .filter((item) => typeof item?.id === "string")
+    .filter((item): item is Record<string, unknown> => {
+      return isRecord(item) && typeof item.id === "string";
+    })
     .map((item) => ({
-      id: item.id,
-      name: item?.name,
-      object: item?.object,
-      description: item?.description ?? item?.owned_by,
-      created_at: item?.created_at,
-      owned_by: item?.owned_by,
+      id: item.id as string,
+      name: typeof item.name === "string" ? item.name : undefined,
+      object: typeof item.object === "string" ? item.object : undefined,
+      description:
+        typeof item.description === "string"
+          ? item.description
+          : typeof item.owned_by === "string"
+          ? item.owned_by
+          : undefined,
+      created_at:
+        typeof item.created_at === "number" ? item.created_at : undefined,
+      owned_by: typeof item.owned_by === "string" ? item.owned_by : undefined,
     }));
 };
 

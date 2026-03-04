@@ -1,31 +1,118 @@
-# AI Art Studio
+# TextCreateImageTestView
 
-这是一个纯前端的文本画图演示，整合 OpenAI 兼容接口与 NovelAI 官方流式服务，将提示词、参考图、自定义参数串成闭环画图体验。
+一个以 **Markdown/Prompt 实验友好** 为目标的 AI 绘图前端项目：
 
-## 快速启动
+- OpenAI 兼容图像生成（可选 LLM 提示词优化）
+- NovelAI 官方流式接口（SSE/msgpack）
+- 本地缓存配置与历史记录
+
+> 默认可作为纯前端项目运行；`server/` 目录提供可选的后端示例 API。
+
+## 功能概览
+
+### 1) OpenAI 兼容文本画图
+
+- 拉取 `/models` 模型列表
+- 可选先走 LLM 优化提示词，再请求图像生成
+- 支持参考图、遮罩、负面提示词、seed/steps/guidance
+- 历史结果可回填做下一轮微调
+
+### 2) NovelAI 流式画图
+
+- 请求 `generate-image-stream`
+- 实时解析事件流并预览中间帧
+- 支持复制完整 JSON payload（便于复刻）
+- 历史结果可复用为参考图
+
+## 技术栈
+
+- Frontend: React 19 + TypeScript + Vite + Tailwind + shadcn/ui
+- Backend (optional): Node.js + Express + Prisma
+- CI: GitHub Actions
+- Dependency maintenance: Dependabot
+
+## 目录结构
+
+```text
+.
+├─ src/                # 前端源码
+├─ server/             # 可选后端示例
+├─ scripts/            # 辅助脚本（端口清理等）
+└─ .github/            # CI / 模板 / 依赖更新配置
+```
+
+## 快速开始
+
+### 仅运行前端（推荐）
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
-打开 http://localhost:5173/ 直接进入 “文本画图” 与 “NovelAI” 两大模块，所有配置信息/历史纪录都缓存于浏览器。
+打开 <http://localhost:5173>
 
-## 核心功能
+### 运行前后端（可选）
 
-### 文本画图（OpenAI 兼容）
+```bash
+npm ci
+npm run server:install
+npm run prisma:generate
+npm run full:dev
+```
 
-- 通过 `GET /v1/models` 读取模型列表，支持用户手动选择 LLM（用于提示词优化）与图像模型。
-- 支持将描述文本、附加提示、负面词以及可选参考图按 OpenAI 多模态格式打包到 `/v1/chat/completions`。
-- 按输出张数逐次调用 `/v1/images/generations` 或 `/v1/images/edits`（带参考图/遮罩），将结果累积至历史记录。
+- Frontend: <http://localhost:5173>
+- Backend: <http://localhost:3001/api>
 
-### NovelAI 画图
+## 环境变量
 
-- 调用 `https://image.novelai.net/ai/generate-image-stream`，可设置模型、采样器、步数、Seed、CFG、尺寸、参考图、质量等参数。
-- 自动解析 msgpack 流、提取 Base64 图片并展示，用户可以复制 JSON 请求体便于复刻官网行为。
-- 生成记录保存在本地，支持再加载提示词或将该图作为下一次微调的参考。
+### 前端（可选）
 
-### 说明
+复制 `.env.local.example` 为 `.env.local`：
 
-- 所有 API 地址、Key、模型、尺寸、数量等配置保存在 `LocalStorage`，页面刷新后仍可恢复上次环境。
-- 仅剩上述两个模块，所有旧的 TestTable / User 管理、后端演示代码已经被移除，项目现在只专注于 AI 画图与提示词优化。
+```bash
+cp .env.local.example .env.local
+```
+
+### 后端（可选）
+
+复制 `server/.env.example` 为 `server/.env`：
+
+```bash
+cp server/.env.example server/.env
+```
+
+> `DATABASE_URL` 必填，且需保证数据库可访问。
+
+## 常用脚本
+
+```bash
+npm run dev            # 启动前端开发模式
+npm run build          # 构建前端
+npm run lint           # 代码检查（含 server/*.ts）
+npm run check          # lint + 前端构建 + 后端构建
+
+npm run server:dev     # 启动后端开发模式
+npm run server:build   # 构建后端
+npm run server:start   # 运行后端产物
+
+npm run kill:all       # 关闭常见开发端口
+npm run restart        # 重启前后端开发环境
+```
+
+## 安全建议
+
+- 不要把 API Key 提交到仓库
+- 生产环境请通过反向代理或 BFF 隔离敏感密钥
+- 发现安全问题请走私有通道（见 `SECURITY.md`）
+
+## 贡献
+
+欢迎提 Issue / PR。提交前请阅读：
+
+- `CONTRIBUTING.md`
+- `.github/pull_request_template.md`
+
+## License
+
+MIT

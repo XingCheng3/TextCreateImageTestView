@@ -1,7 +1,12 @@
 /**
  * 全局错误处理中间件
  */
-import { Request, Response, NextFunction } from "express";
+import type {
+  NextFunction,
+  Request,
+  RequestHandler,
+  Response,
+} from "express";
 
 export class AppError extends Error {
   constructor(
@@ -20,6 +25,10 @@ export const errorHandler = (
   res: Response,
   next: NextFunction
 ) => {
+  // 保留形参用于兼容 Express 错误处理中间件签名
+  void req;
+  void next;
+
   if (err instanceof AppError) {
     return res.status(err.statusCode).json({
       success: false,
@@ -36,8 +45,14 @@ export const errorHandler = (
   });
 };
 
-export const asyncHandler = (fn: Function) => {
-  return (req: Request, res: Response, next: NextFunction) => {
-    Promise.resolve(fn(req, res, next)).catch(next);
+type AsyncRequestHandler = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => Promise<unknown>;
+
+export const asyncHandler = (fn: AsyncRequestHandler): RequestHandler => {
+  return (req, res, next) => {
+    void Promise.resolve(fn(req, res, next)).catch(next);
   };
 };
