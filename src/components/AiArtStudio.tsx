@@ -22,22 +22,22 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useToast } from "@/hooks/use-toast";
 import { createAiArtClient } from "@/services/aiArtService";
 import type {
+  ChatMessageContentBlock,
   GeneratedImageResponse,
   ModelDescriptor,
-  ChatMessageContentBlock,
 } from "@/services/aiArtService";
 import { useLocalStorageState } from "@/lib/use-local-storage";
 import { dataUrlToFile, fileToDataUrl } from "@/lib/image-utils";
 import axios from "axios";
 import type { CancelToken, CancelTokenSource } from "axios";
 import {
+  Clock3,
   Image,
+  Layers,
+  Loader2,
+  RefreshCw,
   Sparkles,
   Wand2,
-  RefreshCw,
-  Layers,
-  Clock3,
-  Loader2,
 } from "lucide-react";
 
 type AiArtConfig = {
@@ -45,7 +45,10 @@ type AiArtConfig = {
   apiKey: string;
   imageModel: string;
   llmModel: string;
+  llmSystemPrompt: string;
   size: string;
+  customWidth: string;
+  customHeight: string;
   outputCount: number;
   useLLM: boolean;
   seed: string;
@@ -63,12 +66,57 @@ type AiArtHistoryEntry = {
   configSnapshot: Pick<AiArtConfig, "imageModel" | "size" | "outputCount">;
 };
 
+type ParsedOptimizedPrompt = {
+  positivePrompt: string;
+  negativePrompt?: string;
+};
+
+const MAX_HISTORY_ITEMS = 6;
+const OUTPUT_OPTIONS = [1, 2, 3, 4];
+const MAX_CACHE_IMAGE_BYTES = 5 * 1024 * 1024;
+
+const SIZE_OPTIONS = [
+  "512x512",
+  "640x640",
+  "768x768",
+  "896x896",
+  "1024x1024",
+  "1216x832",
+  "832x1216",
+  "1536x1024",
+  "1024x1536",
+  "1792x1024",
+  "1024x1792",
+];
+
+const DEFAULT_LLM_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-5-mini"];
+const DEFAULT_IMAGE_MODELS = [
+  "grok-imagine-1.0",
+  "grok-imagine-image",
+  "gpt-image-1",
+  "dall-e-3",
+  "claude-3.5-sonic",
+];
+
+const DEFAULT_SYSTEM_PROMPT = [
+  "你是一名专业的 AI 绘图提示词优化师。",
+  "请将用户描述改写成可直接用于图像模型的提示词。",
+  "必须严格输出下面范式，不要输出任何额外说明、标题或寒暄：",
+  "$正向{这里写正向提示词}",
+  "$反向{这里写反向提示词，没有可留空}",
+  "要求：",
+  "1) 保留用户核心意图；2) 增强构图、光线、风格与细节；3) 正向与反向不要混写。",
+].join("\n");
+
 const DEFAULT_CONFIG: AiArtConfig = {
   apiBaseUrl: "https://api.openai.com/v1",
   apiKey: "",
   imageModel: "gpt-image-1",
   llmModel: "gpt-4o-mini",
+  llmSystemPrompt: DEFAULT_SYSTEM_PROMPT,
   size: "1024x1024",
+  customWidth: "",
+  customHeight: "",
   outputCount: 1,
   useLLM: true,
   seed: "",
@@ -77,21 +125,6 @@ const DEFAULT_CONFIG: AiArtConfig = {
 };
 
 const DEFAULT_HISTORY: AiArtHistoryEntry[] = [];
-
-const MODEL_SELECT_PLACEHOLDER = "请选择模型";
-const EMPTY_LLM_RESULT_VALUE = "__no_llm_model_result__";
-
-const MAX_HISTORY_ITEMS = 6;
-
-const SIZE_OPTIONS = ["512x512", "768x768", "1024x1024"];
-
-const OUTPUT_OPTIONS = [1, 2, 3, 4];
-
-const DEFAULT_LLM_MODELS = ["gpt-4o-mini", "gpt-4o"];
-const DEFAULT_IMAGE_MODELS = ["gpt-image-1", "dall-e-3", "claude-3.5-sonic"];
-
-const SYSTEM_PROMPT =
-  "你是一名专业的 AI 绘图提示词优化师。将用户提供的描述升级为更清晰、细致且适配图像生成模型的提示词，保留原意并补充风格、场景、光线等细节。";
 
 const LOCAL_STORAGE_KEYS = {
   CONFIG: "ai-art-config-v1",
@@ -117,6 +150,25 @@ const parseNumberInput = (value?: string) => {
   return Number.isNaN(parsed) ? undefined : parsed;
 };
 
+const parseDimensionInput = (value?: string) => {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) {
+    return undefined;
+  }
+  const rounded = Math.round(parsed);
+  if (rounded < 64 || rounded > 4096) {
+    return undefined;
+  }
+  return rounded;
+};
+
 const isValidHttpUrl = (value?: string) => {
   if (!value) {
     return false;
@@ -130,6 +182,142 @@ const isValidHttpUrl = (value?: string) => {
 };
 
 const isDataUrl = (value: string) => value.startsWith("data:");
+
+const stripCodeFence = (value: string) =>
+  value.replace(/```[a-zA-Z]*\n?/g, "").replace(/```/g, "").trim();
+
+const cleanPromptText = (value: string) => {
+  return stripCodeFence(value)
+    .replace(/^当然可以[，。!！]?\s*/i, "")
+    .replace(/^下面是优化后的绘图提示词[^\n]*\n?/i, "")
+    .replace(/^#+\s*/gm, "")
+    .trim();
+};
+
+const extractTaggedBlock = (source: string, tag: string) => {
+  const marker = `$${tag}{`;
+  const start = source.indexOf(marker);
+  if (start === -1) {
+    return undefined;
+  }
+
+  let cursor = start + marker.length;
+  let depth = 1;
+  while (cursor < source.length && depth > 0) {
+    const char = source[cursor];
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+    }
+    cursor += 1;
+  }
+
+  if (depth !== 0) {
+    return undefined;
+  }
+
+  return source.slice(start + marker.length, cursor - 1).trim();
+};
+
+const tryParseJsonPayload = (source: string) => {
+  const cleaned = cleanPromptText(source);
+  const candidates = [cleaned];
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    candidates.push(cleaned.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as Record<string, unknown>;
+      return parsed;
+    } catch {
+      // ignore invalid json
+    }
+  }
+
+  return null;
+};
+
+const pickStringField = (
+  payload: Record<string, unknown>,
+  keys: string[]
+): string | undefined => {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+};
+
+const parseOptimizedPrompt = (
+  rawOutput: string,
+  fallbackNegativePrompt?: string
+): ParsedOptimizedPrompt => {
+  const cleaned = cleanPromptText(rawOutput);
+
+  const jsonPayload = tryParseJsonPayload(cleaned);
+  if (jsonPayload) {
+    const positive = pickStringField(jsonPayload, [
+      "positive",
+      "positive_prompt",
+      "prompt",
+      "final_prompt",
+    ]);
+    if (positive) {
+      const negative = pickStringField(jsonPayload, [
+        "negative",
+        "negative_prompt",
+        "anti_prompt",
+      ]);
+      return {
+        positivePrompt: positive,
+        negativePrompt: negative ?? fallbackNegativePrompt,
+      };
+    }
+  }
+
+  const taggedPositive =
+    extractTaggedBlock(cleaned, "正向") ??
+    extractTaggedBlock(cleaned, "positive") ??
+    extractTaggedBlock(cleaned, "Positive");
+  const taggedNegative =
+    extractTaggedBlock(cleaned, "反向") ??
+    extractTaggedBlock(cleaned, "负向") ??
+    extractTaggedBlock(cleaned, "negative") ??
+    extractTaggedBlock(cleaned, "Negative");
+
+  if (taggedPositive) {
+    return {
+      positivePrompt: taggedPositive,
+      negativePrompt: taggedNegative ?? fallbackNegativePrompt,
+    };
+  }
+
+  const headingPositive = cleaned.match(
+    /(?:正向提示词|优化提示词|positive\s*prompt)\s*[：:]\s*([\s\S]*?)(?=\n\s*(?:反向提示词|负向提示词|negative\s*prompt)\s*[：:]|$)/i
+  )?.[1];
+  const headingNegative = cleaned.match(
+    /(?:反向提示词|负向提示词|negative\s*prompt)\s*[：:]\s*([\s\S]*)$/i
+  )?.[1];
+
+  if (headingPositive?.trim()) {
+    return {
+      positivePrompt: headingPositive.trim(),
+      negativePrompt: headingNegative?.trim() || fallbackNegativePrompt,
+    };
+  }
+
+  return {
+    positivePrompt: cleaned,
+    negativePrompt: fallbackNegativePrompt,
+  };
+};
 
 const extractErrorMessage = (error: unknown, fallback: string) => {
   if (axios.isCancel(error)) {
@@ -153,6 +341,39 @@ const extractErrorMessage = (error: unknown, fallback: string) => {
   return fallback;
 };
 
+const cacheRemoteImageToDataUrl = async (image: string) => {
+  if (isDataUrl(image)) {
+    return image;
+  }
+
+  try {
+    const response = await fetch(image, {
+      method: "GET",
+      mode: "cors",
+      credentials: "omit",
+    });
+    if (!response.ok) {
+      return image;
+    }
+
+    const blob = await response.blob();
+    if (!blob.type.startsWith("image/")) {
+      return image;
+    }
+    if (blob.size > MAX_CACHE_IMAGE_BYTES) {
+      return image;
+    }
+
+    const extension = blob.type.split("/")[1] || "png";
+    const file = new File([blob], `cached-${Date.now()}.${extension}`, {
+      type: blob.type,
+    });
+    return await fileToDataUrl(file);
+  } catch {
+    return image;
+  }
+};
+
 export function AiArtStudio() {
   const { toast } = useToast();
 
@@ -174,7 +395,6 @@ export function AiArtStudio() {
   const [modelsUpdatedAt, setModelsUpdatedAt] = useState<string | null>(null);
   const [loadingModels, setLoadingModels] = useState(false);
   const [modelsError, setModelsError] = useState<string | null>(null);
-  const [llmModelFilter, setLlmModelFilter] = useState("");
 
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [remoteReferenceUrl, setRemoteReferenceUrl] = useState("");
@@ -186,6 +406,7 @@ export function AiArtStudio() {
   const [generatedImages, setGeneratedImages] = useState<string[]>([]);
   const [analysisLog, setAnalysisLog] = useState<string[]>([]);
   const [finalPrompt, setFinalPrompt] = useState("");
+  const [finalNegativePrompt, setFinalNegativePrompt] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [cancelSource, setCancelSource] = useState<CancelTokenSource | null>(
@@ -195,6 +416,20 @@ export function AiArtStudio() {
   const startTimeRef = useRef(0);
   const referenceSectionRef = useRef<HTMLElement | null>(null);
 
+  useEffect(() => {
+    setConfig((prev) => {
+      const merged = {
+        ...DEFAULT_CONFIG,
+        ...prev,
+        llmSystemPrompt:
+          prev.llmSystemPrompt?.trim() || DEFAULT_CONFIG.llmSystemPrompt,
+        customWidth: prev.customWidth ?? "",
+        customHeight: prev.customHeight ?? "",
+      };
+      return JSON.stringify(prev) === JSON.stringify(merged) ? prev : merged;
+    });
+  }, [setConfig]);
+
   const apiClient = useMemo(
     () =>
       createAiArtClient({
@@ -203,6 +438,23 @@ export function AiArtStudio() {
       }),
     [config.apiBaseUrl, config.apiKey]
   );
+
+  const customSize = useMemo(() => {
+    const widthRaw = config.customWidth.trim();
+    const heightRaw = config.customHeight.trim();
+    if (!widthRaw && !heightRaw) {
+      return undefined;
+    }
+
+    const width = parseDimensionInput(widthRaw);
+    const height = parseDimensionInput(heightRaw);
+    if (!width || !height) {
+      return null;
+    }
+    return `${width}x${height}`;
+  }, [config.customHeight, config.customWidth]);
+
+  const sizeForModel = customSize || config.size;
 
   useEffect(() => {
     if (!referenceFile) {
@@ -244,32 +496,10 @@ export function AiArtStudio() {
     ? models
     : DEFAULT_IMAGE_MODELS.map<ModelDescriptor>((id) => ({ id }));
 
-  const filteredLLMModels = useMemo(() => {
-    const keyword = llmModelFilter.trim().toLowerCase();
-    if (!keyword) {
-      return availableLLMModels;
-    }
-    return availableLLMModels.filter((model) => {
-      const haystack = [model.id, model.name, model.description, model.owned_by]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(keyword);
-    });
-  }, [availableLLMModels, llmModelFilter]);
-
-  const mapModelList = (list: ModelDescriptor[]) =>
-    list.map((model) => (
-      <SelectItem key={model.id} value={model.id}>
-        {model.id}
-        {model.description ? ` · ${model.description}` : ""}
-      </SelectItem>
-    ));
-
   const pushLog = (message: string) => {
     setAnalysisLog((prev) => {
       const next = [...prev, `${new Date().toLocaleTimeString()} · ${message}`];
-      if (next.length > 8) {
+      if (next.length > 10) {
         next.shift();
       }
       return next;
@@ -423,16 +653,19 @@ export function AiArtStudio() {
       })
       .filter(Boolean) as string[];
 
-  const callImageApiOnce = async (
-    promptForModel: string,
-    cancelToken?: CancelToken
-  ) => {
+  const callImageApiOnce = async (params: {
+    promptForModel: string;
+    sizeForModel: string;
+    negativePromptForModel?: string;
+    cancelToken?: CancelToken;
+  }) => {
     const seedValue = parseNumberInput(config.seed);
     const stepsValue = parseNumberInput(config.steps);
     const guidanceValue = parseNumberInput(config.guidance);
-    const normalizedNegativePrompt = negativePrompt.trim() || undefined;
+    const normalizedNegativePrompt = params.negativePromptForModel?.trim();
     const normalizedEditNotes = editNotes.trim() || undefined;
     const trimmedRemoteReference = remoteReferenceUrl.trim();
+
     if (referenceFile || trimmedRemoteReference) {
       const form = new FormData();
       if (referenceFile) {
@@ -443,10 +676,10 @@ export function AiArtStudio() {
       if (maskFile) {
         form.append("mask", maskFile);
       }
-      form.append("prompt", promptForModel);
+      form.append("prompt", params.promptForModel);
       form.append("model", config.imageModel);
       form.append("n", "1");
-      form.append("size", config.size);
+      form.append("size", params.sizeForModel);
       if (normalizedNegativePrompt) {
         form.append("negative_prompt", normalizedNegativePrompt);
       }
@@ -463,20 +696,21 @@ export function AiArtStudio() {
         form.append("guidance", guidanceValue.toString());
       }
       const responses = await apiClient.editImage(form, {
-        cancelToken,
+        cancelToken: params.cancelToken,
       });
       return responsesToUrls(responses);
     }
+
     const responses = await apiClient.generateImages({
-      prompt: promptForModel,
+      prompt: params.promptForModel,
       model: config.imageModel,
-      size: config.size,
+      size: params.sizeForModel,
       n: 1,
       negativePrompt: normalizedNegativePrompt,
       seed: seedValue,
       steps: stepsValue,
       guidance: guidanceValue,
-      cancelToken,
+      cancelToken: params.cancelToken,
     });
     return responsesToUrls(responses);
   };
@@ -493,7 +727,20 @@ export function AiArtStudio() {
       });
       return;
     }
-    if (normalizedRemoteReferenceUrl && !isValidHttpUrl(normalizedRemoteReferenceUrl)) {
+
+    if (customSize === null) {
+      toast({
+        title: "自定义分辨率无效",
+        description: "宽高都必须填写，且范围在 64~4096",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (
+      normalizedRemoteReferenceUrl &&
+      !isValidHttpUrl(normalizedRemoteReferenceUrl)
+    ) {
       toast({
         title: "参考图 URL 无效",
         description: "请填写以 http:// 或 https:// 开头的可访问地址",
@@ -509,16 +756,19 @@ export function AiArtStudio() {
       });
       return;
     }
+
     setGenerating(true);
     setGeneratedImages([]);
     setAnalysisLog([]);
     setFinalPrompt("");
+    setFinalNegativePrompt("");
     setErrorMessage(null);
     const source = axios.CancelToken.source();
     setCancelSource(source);
     beginRequestTimer();
 
     let promptForModel = normalizedPrompt;
+    let negativePromptForModel = negativePrompt.trim() || undefined;
 
     try {
       if (config.useLLM && config.llmModel) {
@@ -533,10 +783,10 @@ export function AiArtStudio() {
             text: `补充要求：${normalizedExtraHint}`,
           });
         }
-        if (negativePrompt) {
+        if (negativePromptForModel) {
           userContent.push({
             type: "text",
-            text: `排除内容：${negativePrompt}`,
+            text: `排除内容：${negativePromptForModel}`,
           });
         }
         if (referenceData) {
@@ -550,31 +800,56 @@ export function AiArtStudio() {
         const completion = await apiClient.chatCompletion({
           model: config.llmModel,
           messages: [
-            { role: "system", content: SYSTEM_PROMPT },
+            {
+              role: "system",
+              content: config.llmSystemPrompt || DEFAULT_SYSTEM_PROMPT,
+            },
             {
               role: "user",
               content: userContent,
             },
           ],
         });
+
         if (completion) {
-          promptForModel = completion;
-          pushLog("LLM 输出已采用");
+          const parsed = parseOptimizedPrompt(completion, negativePromptForModel);
+          promptForModel = parsed.positivePrompt;
+          negativePromptForModel = parsed.negativePrompt?.trim() || undefined;
+
+          setPrompt(parsed.positivePrompt);
+          if (parsed.negativePrompt !== undefined) {
+            setNegativePrompt(parsed.negativePrompt);
+          }
+
+          setFinalPrompt(parsed.positivePrompt);
+          setFinalNegativePrompt(parsed.negativePrompt ?? "");
+          pushLog("已按范式提取正向/反向提示词");
         } else {
+          setFinalPrompt(promptForModel);
+          setFinalNegativePrompt(negativePromptForModel ?? "");
           pushLog("LLM 未返回优化结果，保留原始描述");
         }
-      } else if (normalizedExtraHint) {
-        promptForModel = `${normalizedPrompt}\n${normalizedExtraHint}`;
-        pushLog("已将附加细节合并到提示词");
+      } else {
+        if (normalizedExtraHint) {
+          promptForModel = `${normalizedPrompt}\n${normalizedExtraHint}`;
+          pushLog("已将附加细节合并到提示词");
+        }
+        setFinalPrompt(promptForModel);
+        setFinalNegativePrompt(negativePromptForModel ?? "");
       }
-      setFinalPrompt(promptForModel);
-      pushLog("开始调用画图 API");
+
+      pushLog(`开始调用画图 API（分辨率：${sizeForModel}）`);
       const collected: string[] = [];
       const failedAttempts: string[] = [];
       for (let i = 0; i < config.outputCount; i += 1) {
         pushLog(`画图进度：第 ${i + 1}/${config.outputCount} 次`);
         try {
-          const urls = await callImageApiOnce(promptForModel, source.token);
+          const urls = await callImageApiOnce({
+            promptForModel,
+            sizeForModel,
+            negativePromptForModel,
+            cancelToken: source.token,
+          });
           if (urls.length) {
             pushLog(`第 ${i + 1} 次返回 ${urls.length} 张图片`);
             collected.push(...urls);
@@ -586,10 +861,7 @@ export function AiArtStudio() {
           if (axios.isCancel(error)) {
             throw error;
           }
-          const message = extractErrorMessage(
-            error,
-            `第 ${i + 1} 次生成失败`
-          );
+          const message = extractErrorMessage(error, `第 ${i + 1} 次生成失败`);
           failedAttempts.push(message);
           pushLog(`第 ${i + 1} 次失败：${message}`);
         }
@@ -599,19 +871,24 @@ export function AiArtStudio() {
         throw new Error("未收到任何图片结果，请检查 API 响应");
       }
 
-      setGeneratedImages(collected);
-      pushLog(`共生成 ${collected.length} 张图片`);
+      pushLog("尝试缓存图片到浏览器本地");
+      const cachedCollected = await Promise.all(
+        collected.map((image) => cacheRemoteImageToDataUrl(image))
+      );
+
+      setGeneratedImages(cachedCollected);
+      pushLog(`共生成 ${cachedCollected.length} 张图片`);
 
       const entry: AiArtHistoryEntry = {
         id: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
         prompt: normalizedPrompt,
         finalPrompt: promptForModel,
-        images: collected.slice(0, 4),
+        images: cachedCollected.slice(0, 4),
         createdAt: new Date().toISOString(),
         usedReference: Boolean(referenceFile || normalizedRemoteReferenceUrl),
         configSnapshot: {
           imageModel: config.imageModel,
-          size: config.size,
+          size: sizeForModel,
           outputCount: config.outputCount,
         },
       };
@@ -624,7 +901,7 @@ export function AiArtStudio() {
       toast({
         title:
           referenceFile || normalizedRemoteReferenceUrl ? "微调完成" : "生成完成",
-        description: `生成 ${collected.length} 张图片`,
+        description: `生成 ${cachedCollected.length} 张图片`,
       });
 
       if (failedAttempts.length) {
@@ -694,6 +971,7 @@ export function AiArtStudio() {
                   {config.apiBaseUrl || "https://api.openai.com/v1"}。
                 </p>
               </div>
+
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-1">
                   <Label htmlFor="api-base">API 地址</Label>
@@ -727,41 +1005,27 @@ export function AiArtStudio() {
               </div>
 
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                <div className="space-y-2 md:col-span-2 xl:col-span-1">
-                  <div className="flex items-center justify-between">
-                    <Label>LLM 模型（优化提示词）</Label>
-                    <span className="text-xs text-muted-foreground">
-                      {filteredLLMModels.length}/{availableLLMModels.length}
-                    </span>
-                  </div>
+                <div className="space-y-1">
+                  <Label>LLM 模型（优化提示词）</Label>
                   <Input
-                    placeholder="搜索模型"
-                    className="text-sm"
-                    value={llmModelFilter}
-                    onChange={(e) => setLlmModelFilter(e.target.value)}
-                  />
-                  <Select
+                    placeholder="搜索或手动输入模型 ID"
+                    list="llm-model-suggestions"
                     value={config.llmModel}
-                    onValueChange={(value) => updateConfig({ llmModel: value })}
-                  >
-                    <SelectTrigger className="w-full">
-                      <SelectValue placeholder={MODEL_SELECT_PLACEHOLDER} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {filteredLLMModels.length > 0 ? (
-                        mapModelList(filteredLLMModels)
-                      ) : (
-                        <SelectItem value={EMPTY_LLM_RESULT_VALUE} disabled>
-                          未找到匹配模型
-                        </SelectItem>
-                      )}
-                    </SelectContent>
-                  </Select>
+                    onChange={(e) => updateConfig({ llmModel: e.target.value })}
+                  />
+                  <datalist id="llm-model-suggestions">
+                    {availableLLMModels.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.description ?? model.name ?? model.id}
+                      </option>
+                    ))}
+                  </datalist>
                 </div>
+
                 <div className="space-y-1">
                   <Label>画图模型</Label>
                   <Input
-                    placeholder="手动输入模型 ID"
+                    placeholder="搜索或手动输入模型 ID"
                     list="image-model-suggestions"
                     value={config.imageModel}
                     onChange={(e) => updateConfig({ imageModel: e.target.value })}
@@ -774,24 +1038,7 @@ export function AiArtStudio() {
                     ))}
                   </datalist>
                 </div>
-                <div className="space-y-1">
-                  <Label>分辨率</Label>
-                  <Select
-                    value={config.size}
-                    onValueChange={(value) => updateConfig({ size: value })}
-                  >
-                    <SelectTrigger className="w-full">
-                      <SelectValue placeholder="选择分辨率" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {SIZE_OPTIONS.map((size) => (
-                        <SelectItem key={size} value={size}>
-                          {size}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+
                 <div className="space-y-1">
                   <Label>输出张数</Label>
                   <Select
@@ -812,6 +1059,55 @@ export function AiArtStudio() {
                     </SelectContent>
                   </Select>
                 </div>
+              </div>
+
+              <div className="space-y-2 rounded-md border border-border/70 p-3">
+                <Label>分辨率（预设 + 手动）</Label>
+                <div className="grid gap-3 md:grid-cols-[1fr_120px_120px]">
+                  <Select
+                    value={config.size}
+                    onValueChange={(value) => updateConfig({ size: value })}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="选择分辨率预设" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {SIZE_OPTIONS.map((size) => (
+                        <SelectItem key={size} value={size}>
+                          {size}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Input
+                    type="number"
+                    min="64"
+                    max="4096"
+                    step="1"
+                    placeholder="宽 (px)"
+                    value={config.customWidth}
+                    onChange={(event) =>
+                      updateConfig({ customWidth: event.target.value })
+                    }
+                  />
+                  <Input
+                    type="number"
+                    min="64"
+                    max="4096"
+                    step="1"
+                    placeholder="高 (px)"
+                    value={config.customHeight}
+                    onChange={(event) =>
+                      updateConfig({ customHeight: event.target.value })
+                    }
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  当前生图尺寸：{sizeForModel}
+                  {customSize === null
+                    ? "（手动尺寸无效，需同时填写宽高并在 64~4096 之间）"
+                    : ""}
+                </p>
               </div>
 
               <div className="grid gap-4 md:grid-cols-3">
@@ -920,10 +1216,60 @@ export function AiArtStudio() {
                 <label htmlFor="llm-switch">是否启用 LLM 优化提示词（可选）</label>
               </div>
 
+              {config.useLLM && (
+                <div className="space-y-2 rounded-md border border-border/70 p-3">
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="llm-system-prompt">LLM 系统提示词（可编辑）</Label>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      type="button"
+                      onClick={() =>
+                        updateConfig({ llmSystemPrompt: DEFAULT_SYSTEM_PROMPT })
+                      }
+                    >
+                      恢复默认
+                    </Button>
+                  </div>
+                  <textarea
+                    id="llm-system-prompt"
+                    rows={6}
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    value={config.llmSystemPrompt}
+                    onChange={(e) =>
+                      updateConfig({ llmSystemPrompt: e.target.value })
+                    }
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    建议保持 $正向{"{"}...{"}"} / $反向{"{"}...{"}"} 输出范式，便于自动分流到输入框。
+                  </p>
+                </div>
+              )}
+
               {finalPrompt && (
-                <Badge className="inline-flex max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-xs">
-                  最终提示词：{finalPrompt}
-                </Badge>
+                <div className="space-y-2 rounded-md border border-primary/30 bg-primary/5 p-3">
+                  <p className="text-xs font-medium text-primary">LLM 优化结果</p>
+                  <div className="space-y-1">
+                    <Label htmlFor="final-positive">正向提示词（已自动回填）</Label>
+                    <textarea
+                      id="final-positive"
+                      rows={4}
+                      readOnly
+                      value={finalPrompt}
+                      className="w-full rounded-md border bg-background px-3 py-2 text-xs leading-5 text-foreground"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="final-negative">反向提示词（已自动回填）</Label>
+                    <textarea
+                      id="final-negative"
+                      rows={3}
+                      readOnly
+                      value={finalNegativePrompt}
+                      className="w-full rounded-md border bg-background px-3 py-2 text-xs leading-5 text-foreground"
+                    />
+                  </div>
+                </div>
               )}
             </section>
 
@@ -1131,6 +1477,10 @@ export function AiArtStudio() {
                       <p className="mt-2 line-clamp-3 text-sm text-foreground break-words">
                         {item.finalPrompt}
                       </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        模型：{item.configSnapshot.imageModel} · 尺寸：
+                        {item.configSnapshot.size}
+                      </p>
                       <div className="mt-3 grid gap-2 sm:grid-cols-2">
                         {item.images.slice(0, 2).map((image, imageIndex) => (
                           <button
@@ -1164,8 +1514,7 @@ export function AiArtStudio() {
         </div>
       </CardContent>
       <CardFooter className="text-xs text-muted-foreground">
-        所有数据保存在浏览器缓存中，API 请求直接发送给用户配置的 OpenAI
-        兼容服务。
+        配置和历史记录保存在浏览器本地；生成图片会优先尝试转成本地 data URL，减少外链失效导致的历史图丢失。
       </CardFooter>
     </Card>
   );
